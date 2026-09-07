@@ -1,0 +1,12 @@
+[Unit]
+Description=Polling du dossier gdrive:Conv IA (inotify impossible sur un remote)
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+RandomizedDelaySec=60
+AccuracySec=30s
+Unit=convia-sanitize.service
+
+[Install]
+WantedBy=timers.target

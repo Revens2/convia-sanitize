@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Environnement / secrets — jamais versionnés
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+secrets*
+tokens*
+
+# Journaux / états / sauvegardes locales
+*.log
+/tmp/
+backups/
+*.bak
+*.dump
+
+# Éditeurs / OS
+.DS_Store
+*.swp

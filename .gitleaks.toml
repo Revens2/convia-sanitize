@@ -1,0 +1,13 @@
+# Config gitleaks du dépôt convia-sanitize.
+#
+# Les tests de redaction portent volontairement des échantillons en FORME de
+# secrets (préfixe de fournisseur + longueur, ou blocs PEM de base64) afin de
+# prouver que la redaction les capture (tests/test_redact.py, test_rclone_retry.py).
+# Ce sont des valeurs de test invalides, jamais de vraies clés. L'autorisation est
+# limitée au dossier tests/ — le code de production est scanné sans exception.
+title = "convia-sanitize gitleaks"
+[allowlist]
+  description = "fixtures de redaction (secrets factices, jamais de vraies valeurs)"
+  paths = [
+    '''tests/''',
+  ]

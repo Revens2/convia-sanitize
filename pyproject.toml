@@ -1,0 +1,5 @@
+# Configuration pytest du dépôt (le service n'est pas un paquet : le code est
+# exécuté depuis /opt/convia-sanitize via le wrapper systemd).
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
