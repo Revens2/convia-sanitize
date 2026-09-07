@@ -1,16 +1,16 @@
 # convia-sanitize
 
 Sanitizer des conversations IA exportées par `convia` sur `vps-etude`
-(remote Google Drive `convia:`). C'est le composant qui décide ce qui sort du
-corpus de conversations vers le Drive : **le dernier point où un secret peut
-être arrêté avant publication**.
+(remote Google Drive `convia:`), **+ publication RAG découplée**. C'est le
+composant qui décide ce qui sort du corpus de conversations vers le Drive : le
+dernier point où un secret peut être arrêté avant publication.
 
-Ce dépôt est la **source canonique** du service `convia-sanitize.service`.
-L'exécution reste sur `/opt/convia-sanitize/` (VPS) ; toute modification se fait
-ici, est testée, puis déployée — jamais l'inverse. Le code a historiquement été
-versionné dans `homelab-ops` (branche `convia-chain`, commit `04cbf807`) avant
-d'en être retiré de l'arbre courant ; cet historique est conservé tel quel,
-sans copie réintroduite ailleurs.
+Ce dépôt est la **source canonique** des services `convia-sanitize.service` et
+`convia-publish.service`. L'exécution reste sur `/opt/convia-sanitize/` (VPS) ;
+toute modification se fait ici, est testée, puis déployée — jamais l'inverse.
+Le code a historiquement été versionné dans `homelab-ops` (branche
+`convia-chain`, commit `04cbf807`) avant d'en être retiré de l'arbre courant ;
+cet historique est conservé tel quel, sans copie réintroduite ailleurs.
 
 ## Rôle
 
@@ -21,7 +21,8 @@ Google Drive « Conv IA » (convia:)
   → sanitizer/redaction                     (sanitizer.py + redact.py)
   → sauvegarde pristine dans .raw/          (copyto, une seule fois par fichier)
   → réécriture du fichier assaini           (copyto)
-  → publication vers le RAG Vault           (ExecStartPost, rclone copy)
+  → SUCCÈS → OnSuccess= (déclenchement non bloquant)
+       → convia-publish.service             (rclone copy → RAG, découplé)
 ```
 
 Aucune donnée du corpus n'est passée à un shell : `subprocess` est appelé avec
@@ -31,19 +32,40 @@ une liste d'arguments, jamais avec `shell=True`.
 
 | Fichier | Rôle |
 |---|---|
-| `runner.py` | Point d'entrée appelé par le service : polling, manifeste, boucle de traitement, retry borné des lectures |
-| `sanitizer.py` | Transformation des conversations (suppression réflexions/reminders, troncature des résultats, invariants d'intégrité) |
-| `redact.py` | Redaction des secrets (jetons fournisseur, mots de passe) — seule exception au périmètre de conservation |
+| `runner.py` | Sanitizer : polling, manifeste, boucle de traitement, retry borné des lectures, `--version` (commit déployé) |
+| `publish.py` | Publisher RAG (unité `convia-publish.service`) : copies rclone racine + `Traité` → `convia-rag:ConvIA` |
+| `sanitizer.py` | Transformation des conversations |
+| `redact.py` | Redaction des secrets |
 | `tests/` | Suite pytest (voir « Tests ») |
-| `systemd/` | Unités/timer systemd de référence + wrapper `/usr/local/bin/convia_sanitize.py` |
-| `.github/workflows/ci.yml` | CI : scan secrets (gitleaks, arbre + historique) + tests Python |
+| `systemd/` | Unités/timer de référence + wrapper |
+| `deploy/deploy.sh` | Déploiement reproductible (SHA tracé dans `.deployed-commit`) |
+| `.github/workflows/ci.yml` | CI : gitleaks (arbre + historique) + pytest |
+
+## Architecture systemd (depuis 2026-09-07)
+
+```text
+convia-sanitize.timer  (*:0/10)
+   └─ convia-sanitize.service    python de sanitization, SE TERMINE VITE
+        └─ succès → OnSuccess=convia-publish.service   (jamais bloqué par lui)
+```
+
+- `convia-sanitize.service` : **n'a plus d'`ExecStartPost`**. Sa durée = durée
+  du python (listing + sanitization), indépendamment de l'état du RAG.
+- `convia-publish.service` : oneshot autonome (`User=convia`), responsable
+  unique de la publication `convia:`/`convia:Traité` → `convia-rag:ConvIA`.
+  Instance unique systemd → **jamais deux copies concurrentes** (un
+  déclenchement pendant une publication est sérialisé, pas dupliqué).
+  `OnFailure=notify-failure@%n.service` : une panne de publication fait échouer
+  LE PUBLISHER, pas le sanitizer.
+
+Détail des unités et cibles : `systemd/README.md`.
 
 ## État runtime
 
-- `CONVIA_STATE` : `/var/lib/convia` — manifeste `sanitize-manifest.json` +
-  verrou `convia.lock` (partagé avec `convia-analyse.service`).
+- `CONVIA_STATE` : `/var/lib/convia` — manifestes `sanitize-manifest.json`,
+  `convia.lock` (partagé avec le moteur d'analyse).
 - `RCLONE_CONFIG` : `/var/lib/convia/rclone.conf` (0600, **hors Git**).
-- `CONVIA_REMOTE` : `convia:` (Drive « Conv IA »).
+- Remotes : `convia:` (corpus), `convia-rag:` (destination RAG).
 
 ## Principe du manifeste
 
@@ -57,14 +79,6 @@ run n'est pas tamponné comme traité, il repartira au prochain tick.
 La sauvegarde `convia:.raw/<rel>` reçoit l'original **une seule fois**, avant
 toute réécriture. Ne jamais la détruire : c'est la seule trace fidèle.
 
-## Systemd
-
-`convia-sanitize.timer` déclenche `convia-sanitize.service` toutes les 10 min
-(`OnCalendar=*:0/10`, `RandomizedDelaySec=60`). Type `oneshot`, utilisateur
-`convia`, sandboxé (le corpus est une entrée hostile). `OnFailure=notify-failure@%n.service`
-notifie Telegram en cas d'échec — les unités de notification vivent hors de ce
-dépôt (socle `/usr/local/lib/telegram`, `notify_failure.sh`).
-
 ## Politique de retry (lectures uniquement)
 
 Constat du 2026-09-07 : deux échecs transitoires de `rclone lsjson`
@@ -76,30 +90,62 @@ salve.
 
 - **Lectures de listing** (`lsjson`, `lsf`) : 3 tentatives au maximum, backoff
   10 s puis 60 s, journalisées.
-- **Écritures** (`copyto`) : aucune retentative applicative — rejouer une
-  écriture sans preuve peut dupliquer ou écraser.
+- **Écritures** (`copyto`, `copy`) : aucune retentative applicative — rejouer
+  une écriture sans preuve peut dupliquer ou écraser (le publisher s'appuie sur
+  les retries internes de rclone + alerte `OnFailure` en cas d'échec).
 - **Classification** simple : `transient` / `permanent` / `unknown`. Seule une
-  erreur clairement permanente (remote/config introuvable, 401/403/404...) coupe
-  court au retry. Tout le reste est réessayé dans la limite du budget.
+  erreur clairement permanente coupe court au retry.
 - **Jamais d'exit 0 masqué** : si toutes les tentatives échouent, l'exception
-  remonte, l'unité échoue et `OnFailure` notifie. Une vraie panne persistante
-  reste visible et diagnostiquée.
+  remonte, l'unité échoue et `OnFailure` notifie.
+
+## Publication RAG (découplée)
+
+`publish.py` réalise deux copies (`copy`, jamais `sync`, aucune suppression
+distante) et journalise une ligne compacte par copie + une synthèse :
+
+```
+publish copy=root   status=ok files=… duration=…
+publish copy=traite status=ok files=… duration=…
+publish copies=2 status=success duration=…
+```
+
+Optimisation appliquée **sur benchmark** (2026-09-07) : `--fast-list` sur la
+copie racine (arbre à exclusions profondes : 15.5 s → 7.2 s en dry-run) ;
+volontairement PAS sur la copie `Traité` (plus lent : 44 s vs 35 s). Les stats
+rclone sont capturées dans un pipe, jamais déversées dans journald.
 
 ## Observabilité
 
-Chaque échec rclone produit une ligne de journal unique, compacte et redactée :
+Chaque échec rclone (sanitizer ou publisher) produit une ligne de journal
+unique, compacte et redactée :
 
 ```
 rclone op=lsjson attempt=2/3 rc=1 class=transient err="googleapi: Error 429: User Rate Limit Exceeded..."
+publish copy=traite status=failed rc=1 err="…"
 ```
 
 - bornée à 300 caractères, une seule ligne ;
-- les jetons connus sont remplacés par `[REDACTED:<famille>]` (mêmes motifs que
-  `redact.py`) ;
-- jamais le stdout du corpus, jamais la commande complète (les arguments
-  contiennent des chemins de conversation) ;
-- ces lignes peuvent transiter vers Telegram via `notify_failure` (qui lit les
-  dernières lignes du journal) : elles sont donc sûres par conception.
+- jetons remplacés par `[REDACTED:<famille>]` (motifs de `redact.py`) ;
+- jamais le stdout du corpus, jamais la commande complète ;
+- sûres par conception pour `notify_failure` (dernières lignes journal →
+  Telegram).
+
+## Traçabilité du commit déployé
+
+Le déploiement écrit le SHA réel à côté du code ; le runtime ne l'invente
+jamais :
+
+```text
+/opt/convia-sanitize/.deployed-commit   # SHA git complet (identité canonique)
+/opt/convia-sanitize/.deployed-at       # ISO 8601 (information secondaire)
+```
+
+Vérifiable à tout instant :
+
+```bash
+python3 /opt/convia-sanitize/runner.py --version
+# convia-sanitize sanitizer_v2 git=<sha> deployed=<iso>
+```
 
 ## Tests
 
@@ -107,48 +153,48 @@ rclone op=lsjson attempt=2/3 rc=1 class=transient err="googleapi: Error 429: Use
 python3 -m pytest            # depuis la racine du dépôt
 ```
 
-Dépendances de test : `pytest`, `pyyaml` (un seul test lit le frontmatter).
+Dépendances : `pytest`, `pyyaml` (un seul test lit le frontmatter).
 
-- `test_sanitizer.py` — règles de transformation + invariants (frontmatter,
-  messages utilisateur bit-à-bit, idempotence, Markdown jamais cassé).
-- `test_redact.py`, `test_redact_mdp_court.py` — redaction des secrets et
-  régression du mot de passe court (2026-09-06).
-- `test_rclone_retry.py` — budget de retry, classification, non-retry des
-  écritures, redaction/bornage du journal (stub `subprocess.run`, aucun appel
-  réseau).
+- `test_sanitizer.py` — règles + invariants (frontmatter, messages bit-à-bit,
+  idempotence, Markdown jamais cassé).
+- `test_redact.py`, `test_redact_mdp_court.py` — redaction (et régression mdp
+  court).
+- `test_rclone_retry.py` — budget de retry/classification/journal redacté.
+- `test_publish.py` — publisher : commandes construites (fast-list racine
+  seulement), dry-run, échec = rc≠0 + erreur redactée, stats best-effort.
+- `test_version.py` — `--version` lit `.deployed-commit`, fallback `unknown`.
 
-`test_analyse_budget.py` (moteur d'analyse ChatGPT) n'appartient pas à ce dépôt :
-il vit avec le moteur d'analyse, hors périmètre du sanitizer.
+`test_analyse_budget.py` (moteur d'analyse) n'appartient pas à ce dépôt.
 
-## Déploiement / rollback (VPS `vps-etude`)
+## Déploiement / rollback
 
-Cibles (voir `systemd/`) :
-
-| Source (dépôt) | Cible |
-|---|---|
-| `runner.py`, `sanitizer.py`, `redact.py`, `tests/` | `/opt/convia-sanitize/` (propriétaire `convia:convia`, 0644) |
-| `systemd/convia_sanitize.py` | `/usr/local/bin/convia_sanitize.py` |
-| `systemd/convia-sanitize.service` (+ `.service.d/*`) | `/etc/systemd/system/` |
-| `systemd/convia-sanitize.timer` | `/etc/systemd/system/` |
-
-Déploiement d'une nouvelle version du code :
+### Code + traçabilité (mécanisme canonique)
 
 ```bash
-# 1. sauvegarde (rollback immédiat, sans toucher au corpus)
-ssh vps-etude-nb "sudo tar czf /root/convia-sanitize-rollback-\$(date +%Y%m%d-%H%M%S).tar.gz -C /opt convia-sanitize"
-# 2. copie du code (propriétaire conservé)
-scp runner.py sanitizer.py redact.py vps-etude-nb:/tmp/
-ssh vps-etude-nb "sudo install -o convia -g convia -m 0644 /tmp/{runner,sanitizer,redact}.py /opt/convia-sanitize/"
-# 3. vérification syntaxe + run manuel (même utilisateur que systemd)
-ssh vps-etude-nb "sudo -u convia python3 -m py_compile /opt/convia-sanitize/runner.py"
-ssh vps-etude-nb "sudo systemctl start convia-sanitize.service"   # run réel (flock)
+bash deploy/deploy.sh [host]     # host par défaut : vps-etude-nb
 ```
 
-Rollback :
+Le script, depuis un working tree propre : tests → staging → backup ciblé
+(`/var/backups/convia-sanitize/<ts>/`, rétention 2) → installation atomique
+(`install -o convia -g convia -m 0644`) → `.deployed-commit`/`.deployed-at` →
+`py_compile` → `--version` affiché. Il ne déploie jamais `.git`, tests, caches,
+secrets ni archives.
+
+### Unités systemd (rare)
+
+Copier les fichiers `systemd/*` vers `/etc/systemd/system/` (mêmes noms) puis :
 
 ```bash
-ssh vps-etude-nb "sudo tar xzf /root/convia-sanitize-rollback-<TS>.tar.gz -C /opt"
+sudo systemctl daemon-reload
+sudo systemctl start convia-publish.service   # validation ponctuelle
 ```
 
-Ne pas toucher à `/var/lib/convia` (état) ni au remote `convia:` pendant un
-rollback : le code est remplaçable, le corpus ne l'est pas.
+### Rollback
+
+- Backup complet du déploiement précédent :
+  `/root/convia-sanitize-rollback-<date>/opt-convia-sanitize.tar.gz` (créé
+  avant chaque mission) et `/var/backups/convia-sanitize/<ts>/` (automatique).
+- Restauration : `sudo tar xzf … -C /opt` (convia-sanitize-rollback-*) ou
+  recopie du backup `/var/backups`.
+- Ne pas toucher à `/var/lib/convia` ni au remote `convia:` : le code est
+  remplaçable, le corpus ne l'est pas.

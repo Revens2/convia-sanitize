@@ -31,6 +31,29 @@ BACKUP_PREFIX = ".raw"
 EXCLUDES = ["--exclude", "Trait*/**", "--exclude", ".raw/**", "--exclude", "traiter/**"]
 RCLONE = ["rclone", "--config", os.environ.get("RCLONE_CONFIG", "")]
 
+# Traçabilité : le SHA deploye est ECRIT par le mécanisme de déploiement
+# (deploy/deploy.sh) dans `.deployed-commit` a cote de ce fichier. Le runtime
+# ne l'invente jamais : sans fichier, il affiche "unknown". Le `.deployed-at`
+# (ISO) est une information secondaire, le SHA est l'identité canonique.
+_DEPLOYED = Path(__file__).resolve().parent
+
+
+def deployed_commit() -> str:
+    try:
+        return _DEPLOYED.joinpath(".deployed-commit").read_text(
+            encoding="utf-8").strip().splitlines()[0][:40]
+    except OSError:
+        return "unknown"
+
+
+def deployed_at() -> str:
+    try:
+        return _DEPLOYED.joinpath(".deployed-at").read_text(
+            encoding="utf-8").strip().splitlines()[0]
+    except OSError:
+        return "unknown"
+
+
 from redact import SECRET_PATTERNS, marker as _redact_marker  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -175,13 +198,20 @@ def needs_work(entry: dict, man: dict) -> bool:
     )
 
 
-def main() -> int:
+def _main() -> int:
     ap = argparse.ArgumentParser(description="Sanitizer des conversations IA")
     ap.add_argument("--dry-run", action="store_true", help="aucune ecriture sur le Drive")
     ap.add_argument("--all", action="store_true", help="ignorer le manifeste")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--local", type=Path, help="travailler sur un repertoire local (mesure)")
+    ap.add_argument("--version", action="store_true",
+                    help="afficher la version et le commit deploye")
     args = ap.parse_args()
+
+    if args.version:
+        print("convia-sanitize sanitizer_v%d git=%s deployed=%s" % (
+            VERSION, deployed_commit(), deployed_at()))
+        return 0
 
     if args.local:
         return measure_local(args.local)
@@ -289,6 +319,24 @@ def report(before: int, after: int, agg: dict) -> None:
     print("redactions=%d" % sum(red.values()))
     for k, v in red.items():
         print("  %-24s %6d occurrence(s)" % (k, v))
+
+
+def main() -> int:
+    """Point d'entree : mesure la duree totale et journalise une ligne compacte.
+
+    Une panne reste une panne : l'exception remonte (unite FAILED -> OnFailure
+    -> Telegram) apres une ligne `sanitize status=failed`.
+    """
+    t0 = time.monotonic()
+    try:
+        rc = _main()
+    except Exception:
+        print("sanitize status=failed duration=%.1fs" % (time.monotonic() - t0),
+              flush=True)
+        raise
+    print("sanitize status=success duration=%.1fs rc=%d" % (
+        time.monotonic() - t0, rc), flush=True)
+    return rc
 
 
 if __name__ == "__main__":

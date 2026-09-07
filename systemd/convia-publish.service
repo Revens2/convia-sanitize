@@ -1,0 +1,63 @@
+# convia-publish.service - Publication ConvIA vers le RAG.
+#
+# Decouple de convia-sanitize.service (mission 4, 2026-09-07) : le sanitizer
+# declenche ce publisher via OnSuccess= et ne l'attend JAMAIS. Ce service
+# copie les conversations assainies (racine convia:) et deplacees (convia:Traité)
+# vers le remote RAG `convia-rag:ConvIA`. rclone copy, jamais sync : aucune
+# suppression distante automatique.
+#
+# Type=oneshot + instance unique systemd => jamais deux copies concurrentes.
+# Un echec de publication fait echouer CETTE unite (pas le sanitizer) et
+# notifie Telegram via OnFailure=notify-failure@%n.service.
+[Unit]
+Description=Publication ConvIA vers le RAG (Drive -> convia-rag:ConvIA)
+After=network-online.target
+Wants=network-online.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=convia
+Group=convia
+Environment=HOME=/var/lib/convia
+Environment=RCLONE_CONFIG=/var/lib/convia/rclone.conf
+Environment=CONVIA_REMOTE=convia:
+Environment=CONVIA_RAG_REMOTE=convia-rag:ConvIA
+Environment=PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/var/lib/convia
+ExecStart=/usr/bin/python3 /opt/convia-sanitize/publish.py
+TimeoutStartSec=1h
+Nice=10
+
+# --- bac a sable : memes regles que le sanitizer ---------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+ReadWritePaths=/var/lib/convia
+ReadOnlyPaths=/opt/convia-sanitize
+InaccessiblePaths=/srv/docs /run/docker.sock /var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target
