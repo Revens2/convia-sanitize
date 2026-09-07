@@ -102,8 +102,8 @@ def test_main_succes(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["publish.py"])
     assert publish.main() == 0
     out = capsys.readouterr().out
-    assert "publish copy=root status=ok files=4" in out
-    assert "publish copy=traite status=ok files=4" in out
+    assert "publish copy=root status=ok files=4/4" in out
+    assert "publish copy=traite status=ok files=4/4" in out
     assert "publish copies=2 status=success" in out
 
 
@@ -111,5 +111,27 @@ def test_main_succes(monkeypatch, capsys):
 def test_parse_stats():
     s = publish.parse_stats(STATS_SAMPLE)
     assert s["files"] == 4
+    assert s["total"] == 4
     assert s["elapsed"] == 32.7
     assert publish.parse_stats("")["files"] == 0
+
+
+def test_parse_stats_bloc_partiel_seulement(monkeypatch, capsys):
+    """Pas de bloc a 100%% (run coupe en plein transfert) : on garde le
+    meilleur couple vu au lieu d'afficher files=0 (bug observe 2026-09-07 sur
+    les runs longs)."""
+    partial = (
+        "Transferred:   \t  12.4 MiB / 12.4 MiB, 100%, 0 B/s, ETA -\n"
+        "Checks:               119 / 119, 100%\n"
+        "Transferred:           42 / 83, 51%\n"
+        "Elapsed time:      1m29.3s\n"
+    )
+    s = publish.parse_stats(partial)
+    assert s["files"] == 42
+    assert s["total"] == 83
+    assert s["bytes_raw"] == "12.4 MiB"
+    _install(monkeypatch, [_res(stderr=partial)])
+    assert publish.run_copy("root", publish.ROOT_COPY, False) == 0
+    out = capsys.readouterr().out
+    assert "files=42/83" in out
+    assert "12.4 MiB" not in out, "la taille brute reste hors journal"

@@ -73,18 +73,30 @@ def _scrub(text: str) -> str:
 
 
 def parse_stats(stderr: str) -> dict:
-    """Extrait du flux de stats rclone : fichiers transferes, octets, duree."""
-    out = {"files": 0, "bytes": 0, "elapsed": 0.0}
+    """Extrait du flux de stats rclone : fichiers transferes, octets, duree.
+
+    Best-effort : rclone n'emettra un bloc a 100%% que si un tick tombe
+    exactement a la fin (sinon `files=0` sur les runs longs, cf. runs contraints
+    du 2026-09-07). On retient donc le MEILLEUR couple done/total observe au
+    lieu de n'accepter que les blocs a 100%%. `files` = done max, `total` = le
+    total du meme bloc. Le flux `--stats 2s` va sur stderr (PIPE) : jamais dans
+    journald, seule la synthese Python d'une ligne y parvient.
+    """
+    out = {"files": 0, "total": 0, "bytes_raw": "", "elapsed": 0.0}
     if not stderr:
         return out
-    trans_files = re.findall(
-        r"^Transferred:\s+(\d+) / \d+, 100%$", stderr, re.MULTILINE)
+    done_max = total_max = 0
+    for m in re.finditer(
+            r"^Transferred:\s+(\d+) / (\d+), \d+%", stderr, re.MULTILINE):
+        done, total = int(m.group(1)), int(m.group(2))
+        if done > done_max:
+            done_max, total_max = done, total
     trans_size = re.findall(
-        r"^Transferred:\s+([0-9.]+ [A-Za-z]+) / [0-9.]+ [A-Za-z]+, 100%",
+        r"^Transferred:\s+([0-9.]+ [A-Za-z]+) / [0-9.]+ [A-Za-z]+, \d+%",
         stderr, re.MULTILINE)
     elapsed = re.findall(r"^Elapsed time:\s+([0-9.]+)s$", stderr, re.MULTILINE)
-    if trans_files:
-        out["files"] = int(trans_files[-1])
+    if done_max:
+        out["files"], out["total"] = done_max, total_max
     if trans_size:
         out["bytes_raw"] = trans_size[-1]
     if elapsed:
@@ -104,8 +116,10 @@ def _log(copy_name: str, kind: str, exc=None, stats=None, duration=None):
         return
     dur = "%.1fs" % (duration or 0.0)
     files = stats.get("files", 0) if stats else 0
-    print("publish copy=%s status=ok files=%d duration=%s" % (
-        copy_name, files, dur), flush=True)
+    total = stats.get("total", 0) if stats else 0
+    label = "%d/%d" % (files, total) if total else str(files)
+    print("publish copy=%s status=ok files=%s duration=%s" % (
+        copy_name, label, dur), flush=True)
 
 
 def run_copy(name: str, args: list[str], dry_run: bool) -> int:
