@@ -25,9 +25,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sanitizer import VERSION, frontmatter_version, sanitize_with_stats  # noqa: E402
 
 REMOTE = os.environ.get("CONVIA_REMOTE", "convia:")
-STATE_DIR = Path(os.environ.get("CONVIA_STATE", "/var/lib/convia"))
-MANIFEST = STATE_DIR / "sanitize-manifest.json"
 BACKUP_PREFIX = ".raw"
+
+# Chemins d'etat lus LAZYMENT (mission 5) : tests et deploiement peuvent
+# surcharger CONVIA_STATE / CONVIA_PUBLISH_SPOOL sans reimporter le module.
+def _state_dir() -> Path:
+    return Path(os.environ.get("CONVIA_STATE", "/var/lib/convia"))
+
+
+def _manifest_path() -> Path:
+    return _state_dir() / "sanitize-manifest.json"
+
+
+def _publish_spool() -> Path:
+    return Path(os.environ.get(
+        "CONVIA_PUBLISH_SPOOL", str(_state_dir() / "publish-requests")))
 EXCLUDES = ["--exclude", "Trait*/**", "--exclude", ".raw/**", "--exclude", "traiter/**"]
 RCLONE = ["rclone", "--config", os.environ.get("RCLONE_CONFIG", "")]
 
@@ -173,18 +185,52 @@ def list_remote() -> list[dict]:
     return [f for f in json.loads(out) if f["Path"].endswith(".md")]
 
 
+def _request_publish(reason: str) -> None:
+    """Demande durable de publication (mission 5).
+
+    Cree ATOMIQUEMENT un fichier dans publish-requests/ AVANT la premiere
+    mutation distante d'un run : si le processus meurt juste apres la mutation,
+    la demande existe deja et convia-publish.path la consommera. Le publisher ne
+    supprime que les demandes presentes a son demarrage (snapshot) : une demande
+    arrivee pendant un publish reste pour la passe suivante (jamais de perte).
+    Le contenu porte un motif et un horodatage, jamais de chemin de conversation.
+    """
+    spool = _publish_spool()
+    spool.mkdir(parents=True, exist_ok=True)
+    run_id = "%d-%d-%s" % (int(time.time()), os.getpid(), os.urandom(4).hex())
+    fd = os.open(str(spool / run_id), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                time.gmtime()), reason))
+
+
+def _moved_paths(man: dict, entries: list[dict]) -> set[str]:
+    """Chemins du manifeste absents du listing courant.
+
+    Le sanitizer n'efface jamais de fichier : un chemin connu qui disparait du
+    scope racine a ete DEPLACE a l'exterieur (le moteur d'analyse deplace les
+    conversations analysees vers Traite). La copie Traite -> RAG doit alors
+    repasser : c'est une mutation distante a publier, meme si le run n'a rien
+    a reecrire (a_traiter=0).
+    """
+    current = {e["Path"] for e in entries}
+    return set(man) - current
+
+
 def load_manifest() -> dict:
     try:
-        return json.loads(MANIFEST.read_text(encoding="utf-8"))
+        return json.loads(_manifest_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
 
 def save_manifest(data: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = MANIFEST.with_suffix(".json.tmp")
+    _state_dir().mkdir(parents=True, exist_ok=True)
+    path = _manifest_path()
+    tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=1, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, MANIFEST)
+    os.replace(tmp, path)
 
 
 def needs_work(entry: dict, man: dict) -> bool:
@@ -222,7 +268,26 @@ def _main() -> int:
     if args.limit:
         todo = todo[: args.limit]
     print("corpus=%d a_traiter=%d" % (len(entries), len(todo)), flush=True)
+
+    # Mission 5 : une mutation DISTANTE doit produire une demande durable de
+    # publication ; un run sans aucune mutation ne publie JAMAIS. Deux cas :
+    #   a) fichiers a reecrire -> demande creee avant la premiere ecriture,
+    #   b) conversations connues disparues du scope (deplacees vers Traite par
+    #      le moteur d'analyse) -> demande meme si a_traiter=0, puis purge du
+    #      manifeste (sinon la demande se recreerait a chaque tick).
+    requested = False
+    if not args.dry_run and not args.all:
+        moved = _moved_paths(man, entries)
+        if moved:
+            _request_publish("external-move")
+            for rel in moved:
+                man.pop(rel, None)
+            requested = True
+            print("publication demandee (deplacements hors scope)=%d"
+                  % len(moved), flush=True)
     if not todo:
+        if requested:
+            save_manifest(man)
         return 0
 
     total_before = total_after = 0
@@ -250,6 +315,11 @@ def _main() -> int:
             total_after += len(data)
             if args.dry_run:
                 continue
+            # La premiere ecriture distante du run materialise la demande de
+            # publication AVANT la mutation (crash-safe).
+            if not requested:
+                _request_publish("sanitize-rewrite")
+                requested = True
             # 1. sauvegarde de l'original AVANT toute reecriture, UNE SEULE
             #    FOIS. Si .raw/<rel> existe deja, il contient l'original
             #    pristine : l'ecraser avec le contenu courant (deja

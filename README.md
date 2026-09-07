@@ -45,18 +45,31 @@ une liste d'arguments, jamais avec `shell=True`.
 
 ```text
 convia-sanitize.timer  (*:0/10)
-   └─ convia-sanitize.service    python de sanitization, SE TERMINE VITE
-        └─ succès → OnSuccess=convia-publish.service   (jamais bloqué par lui)
+   └─ convia-sanitize.service            python de sanitization, SE TERMINE VITE
+        └─ mutation distante (réécriture / déplacement vers Traité)
+             └─ demande durable → publish-requests/<run-id>
+                  └─ convia-publish.path (DirectoryNotEmpty)
+                       └─ convia-publish.service   (rclone copy racine + Traité → RAG)
 ```
 
-- `convia-sanitize.service` : **n'a plus d'`ExecStartPost`**. Sa durée = durée
-  du python (listing + sanitization), indépendamment de l'état du RAG.
+- `convia-sanitize.service` : **n'a plus d'`ExecStartPost` ni d'`OnSuccess`**
+  (mission 5). Sa durée = durée du python. Il ne déclenche le publisher QUE
+  quand une mutation distante a eu lieu : il pose une **demande durable** dans
+  `/var/lib/convia/publish-requests/` (a) avant la première réécriture d'un
+  run, ou (b) quand une conversation connue disparaît du scope (déplacée vers
+  `Traité` par le moteur d'analyse) — même si `a_traiter=0`.
+- **Un run sans mutation ne publie jamais** : `a_traiter=0` sans déplacement →
+  spool vide → `convia-publish.service` ne démarre pas (les checks rclone
+  peuvent coûter plusieurs minutes même pour zéro fichier, mesuré le
+  2026-09-07 : 7 s à 6 min sur état identique).
 - `convia-publish.service` : oneshot autonome (`User=convia`), responsable
-  unique de la publication `convia:`/`convia:Traité` → `convia-rag:ConvIA`.
-  Instance unique systemd → **jamais deux copies concurrentes** (un
-  déclenchement pendant une publication est sérialisé, pas dupliqué).
-  `OnFailure=notify-failure@%n.service` : une panne de publication fait échouer
-  LE PUBLISHER, pas le sanitizer.
+  unique de la publication. Instance unique systemd → **jamais deux copies
+  concurrentes**. Au démarrage il photographie les demandes présentes ; en cas
+  de succès il supprime **exactement ce snapshot** (une demande posée pendant
+  le publish reste pour la passe suivante — pas de perte d'événement) ; en cas
+  d'échec il ne supprime rien (retentative à la passe suivante). Spool vide →
+  `status=noop`, succès, zéro appel rclone. `OnFailure=notify-failure@%n` :
+  une panne de publication fait échouer LE PUBLISHER, pas le sanitizer.
 
 Détail des unités et cibles : `systemd/README.md`.
 

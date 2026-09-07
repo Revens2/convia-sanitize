@@ -42,6 +42,35 @@ except Exception:  # pragma: no cover - import standalone improbable
 
 REMOTE = os.environ.get("CONVIA_REMOTE", "convia:")
 DEST = os.environ.get("CONVIA_RAG_REMOTE", "convia-rag:ConvIA")
+# Demandes durables posees par le sanitizer (mission 5) : publier seulement
+# quand une mutation a eu lieu, jamais sur un no-op. Lue a CHAQUE appel (pas a
+# l'import) : les tests surchargent via l'environnement.
+SPOOL_DEFAULT = "/var/lib/convia/publish-requests"
+
+
+def _publish_spool() -> Path:
+    return Path(os.environ.get("CONVIA_PUBLISH_SPOOL", SPOOL_DEFAULT))
+
+
+def snapshot_requests() -> list[Path]:
+    """Demandes presentes au DEMARRAGE de ce publish (ordre stable)."""
+    try:
+        return sorted(p for p in _publish_spool().iterdir() if p.is_file())
+    except FileNotFoundError:
+        return []
+
+
+def _drop_requests(requests: list[Path]) -> int:
+    """Supprime EXACTEMENT les demandes du snapshot. Une demande creee pendant
+    le publish (nouvelle mutation) reste pour la passe suivante."""
+    removed = 0
+    for req in requests:
+        try:
+            req.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+    return removed
 ROOT_EXCLUDES = [
     "--exclude", ".raw/**",
     "--exclude", "Trait*/**",
@@ -154,13 +183,27 @@ def main() -> int:
                     help="aucune copie (validation/benchmark)")
     args = ap.parse_args()
     t0 = time.monotonic()
+    requests = snapshot_requests()
+    if not requests:
+        # Gate mission 5 : sans demande durable, AUCUN appel rclone Drive. Ce
+        # chemin couvre aussi un demarrage manuel ou un declenchement .path
+        # parasite : no-op propre, unite success, pas d'alerte.
+        print("publish requests=0 status=noop duration=0.0s", flush=True)
+        return 0
     # Copie 1 puis copie 2 ; on s'arrete a la premiere erreur (alerte utile,
     # pas de demi-publication silencieuse).
     rc = run_copy("root", ROOT_COPY, args.dry_run)
     if rc == 0:
         rc = run_copy("traite", TRAITE_COPY, args.dry_run)
-    print("publish copies=2 status=%s duration=%.1fs" % (
-        "success" if rc == 0 else "failed", time.monotonic() - t0), flush=True)
+    removed = 0
+    if rc == 0 and not args.dry_run:
+        # SUCCESS : consommer uniquement les demandes du snapshot (le dry-run
+        # ne copie rien et ne consomme rien).
+        removed = _drop_requests(requests)
+    remaining = len(snapshot_requests())
+    print("publish requests=%d status=%s duration=%.1fs removed=%d remaining=%d"
+          % (len(requests), "success" if rc == 0 else "failed",
+             time.monotonic() - t0, removed, remaining), flush=True)
     return rc
 
 

@@ -44,6 +44,19 @@ def _install(monkeypatch, results):
     return calls
 
 
+@pytest.fixture
+def spool(tmp_path, monkeypatch):
+    """Spool de demandes durables isole (env lu a chaque appel)."""
+    d = tmp_path / "publish-requests"
+    d.mkdir()
+    monkeypatch.setenv("CONVIA_PUBLISH_SPOOL", str(d))
+    return d
+
+
+def _req(spool, name):
+    (spool / name).write_text("2026-09-07T00:00:00Z test\n", encoding="utf-8")
+
+
 # --- construction des commandes ---------------------------------------------
 def test_copie_racine_fast_list_et_exclusions(monkeypatch):
     calls = _install(monkeypatch, [_res()])
@@ -88,23 +101,71 @@ def test_echec_traite_rc_non_nul_et_log_redige(monkeypatch, capsys):
         assert len(ln) < 400
 
 
-def test_main_s_arrete_a_la_premiere_erreur(monkeypatch, capsys):
+def test_main_spool_vide_noop(spool, monkeypatch, capsys):
+    """Gate mission 5 : spool vide -> success sans AUCUN appel rclone."""
+    def boom(cmd, **kwargs):
+        raise AssertionError("rclone ne doit pas etre appele sur spool vide: %s" % cmd)
+    monkeypatch.setattr(publish.subprocess, "run", boom)
+    monkeypatch.setattr(sys, "argv", ["publish.py"])
+    assert publish.main() == 0
+    out = capsys.readouterr().out
+    assert "requests=0" in out and "status=noop" in out
+
+
+def test_main_s_arrete_a_la_premiere_erreur(spool, monkeypatch, capsys):
+    _req(spool, "req-a")
     _install(monkeypatch, [_res(), _res(rc=1, stderr="connection reset by peer")])
     monkeypatch.setattr(sys, "argv", ["publish.py"])
     assert publish.main() == 1
     out = capsys.readouterr().out
     assert "status=failed" in out
-    assert "publish copies=2 status=failed" in out
+    assert "removed=0" in out and "remaining=1" in out
+    # echec : la demande est CONSERVEE (pas de perte), retentative a la passe suivante
+    assert (spool / "req-a").is_file()
 
 
-def test_main_succes(monkeypatch, capsys):
+def test_main_succes(spool, monkeypatch, capsys):
+    _req(spool, "req-a")
+    _req(spool, "req-b")
     _install(monkeypatch, [_res(stderr=STATS_SAMPLE), _res(stderr=STATS_SAMPLE)])
     monkeypatch.setattr(sys, "argv", ["publish.py"])
     assert publish.main() == 0
     out = capsys.readouterr().out
     assert "publish copy=root status=ok files=4/4" in out
     assert "publish copy=traite status=ok files=4/4" in out
-    assert "publish copies=2 status=success" in out
+    assert "removed=2" in out and "remaining=0" in out
+    assert not (spool / "req-a").exists()
+    assert not (spool / "req-b").exists()
+
+
+def test_demande_creee_pendant_run_reste(spool, monkeypatch, capsys):
+    """Anti-lost-wakeup : une demande posee PENDANT le publish n'est pas
+    consommee (le publisher ne supprime que son snapshot de demarrage)."""
+    _req(spool, "req-a")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        (spool / "req-pendant-run").write_text("x\n", encoding="utf-8")
+        return _res()
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["publish.py"])
+    assert publish.main() == 0
+    assert not (spool / "req-a").exists(), "snapshot consomme"
+    assert (spool / "req-pendant-run").is_file(), "demande tardive conservee"
+    out = capsys.readouterr().out
+    assert "removed=1" in out and "remaining=1" in out
+
+
+def test_dry_run_ne_consomme_pas(spool, monkeypatch, capsys):
+    """Un dry-run ne copie rien et ne consomme AUCUNE demande."""
+    _req(spool, "req-a")
+    _install(monkeypatch, [_res(stderr=STATS_SAMPLE), _res(stderr=STATS_SAMPLE)])
+    monkeypatch.setattr(sys, "argv", ["publish.py", "--dry-run"])
+    assert publish.main() == 0
+    assert (spool / "req-a").is_file()
+    out = capsys.readouterr().out
+    assert "remaining=1" in out
 
 
 # --- analyse des stats (best-effort) ----------------------------------------

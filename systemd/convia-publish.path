@@ -1,0 +1,32 @@
+# convia-publish.path - Declenche la publication RAG quand une demande durable existe.
+#
+# Mission 5 (2026-09-07) : convia-sanitize ne declenche plus le publisher sur un
+# simple succes (OnSuccess= supprime). Il pose une DEMANDE DURABLE dans
+# /var/lib/convia/publish-requests/ des qu'une mutation distante a eu lieu :
+#   - reecriture d'une conversation (sanitize-rewrite), ou
+#   - conversation connue deplacee hors scope par le moteur d'analyse
+#     (external-move, -> Traite).
+# Un run sans mutation (a_traiter=0, rien deplace) ne pose rien : le publisher
+# ne demarre pas et ne consomme AUCUN appel Drive (les checks rclone peuvent
+# couter plusieurs minutes meme pour zero fichier).
+#
+# Cette .path surveille le repertoire : DirectoryNotEmpty declenche
+# convia-publish.service quand un fichier y apparait. Invariants (prouves par
+# tests + validation live) :
+#   - jamais deux copies rclone concurrentes (service oneshot unique systemd) ;
+#   - une demande posee PENDANT un publish reste pour la passe suivante (le
+#     publisher ne consomme que son snapshot au demarrage) et re-declenche la
+#     .path a la fin du run -> pas de perte d'evenement ;
+#   - spool vide -> publish requests=0 status=noop, unite success, 0 rclone.
+#
+# Le repertoire doit exister et appartenir a l'utilisateur convia (cree au
+# deploiement) : le sanitizer ecrit dedans sous sandbox (ReadWritePaths).
+[Unit]
+Description=Declencheur publication ConvIA (demandes durables)
+
+[Path]
+DirectoryNotEmpty=/var/lib/convia/publish-requests
+Unit=convia-publish.service
+
+[Install]
+WantedBy=multi-user.target
